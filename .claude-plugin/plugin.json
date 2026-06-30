@@ -1,0 +1,10 @@
+{
+  "name": "llmemory",
+  "version": "0.1.0",
+  "description": "Search and pull context from your AI chat history (ChatGPT, Claude, Codex, Claude Code) without copy-pasting. Reads your vault live from your own Google Drive — read-only, zero server-side storage.",
+  "author": { "name": "LLMemory", "url": "https://llmemory.xyz" },
+  "homepage": "https://llmemory.xyz",
+  "repository": "https://github.com/meir-may/llmemory-mcp",
+  "license": "MIT",
+  "keywords": ["memory", "context", "chat-history", "chatgpt", "claude", "codex", "claude-code", "mcp", "handoff", "search"]
+}
