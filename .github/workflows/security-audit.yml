@@ -1,0 +1,241 @@
+name: Security Audit
+
+# Self-contained, privacy-hardened multi-scanner audit.
+# Runs Semgrep CE, Trivy, Gitleaks, zizmor, and OSV-Scanner entirely inside
+# GitHub Actions. No third-party account, token, or source upload is involved;
+# all telemetry is disabled. Findings are published as a private artifact plus a
+# run summary. Audit mode by default: findings do NOT block merges.
+#
+# To turn this into a real gate later, set FAIL_ON_FINDINGS to "true" below.
+# When true, non-PR runs (push / schedule / manual) exit non-zero if any
+# high-signal finding exists, which triggers GitHub's built-in failure email —
+# i.e. you only get pinged when something real shows up.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "27 7 * * 1"   # Mondays, 07:27 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FAIL_ON_FINDINGS: "true"
+  # Pinned tool versions (bump deliberately, not via mutable tags).
+  SEMGREP_VERSION: "1.170.0"
+  ZIZMOR_VERSION: "1.27.0"
+  TRIVY_VERSION: "0.72.0"
+  GITLEAKS_VERSION: "8.30.1"
+  OSV_VERSION: "2.4.0"
+  # Privacy: disable every scanner's telemetry / phone-home.
+  SEMGREP_SEND_METRICS: "off"
+  SEMGREP_ENABLE_VERSION_CHECK: "0"
+
+jobs:
+  scan:
+    name: Multi-scanner audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0   # full history so Gitleaks can scan past commits
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare
+        run: mkdir -p reports
+
+      # --- Install pinned scanner CLIs -----------------------------------
+      - name: Install Semgrep and zizmor
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "semgrep==${SEMGREP_VERSION}" "zizmor==${ZIZMOR_VERSION}"
+
+      - name: Install Trivy
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            -o "$RUNNER_TEMP/trivy.tar.gz"
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Install Gitleaks
+        run: |
+          curl -sfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            -o "$RUNNER_TEMP/gitleaks.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/bin" gitleaks
+
+      - name: Install OSV-Scanner
+        run: |
+          curl -sfL "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64" \
+            -o "$RUNNER_TEMP/bin/osv-scanner"
+          chmod +x "$RUNNER_TEMP/bin/osv-scanner"
+
+      # --- Run scanners (never fail the step; we gate at the end) --------
+      - name: Semgrep (SAST)
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config=p/default \
+            --metrics=off \
+            --json --output=reports/semgrep.json \
+            --timeout=45 \
+            --quiet \
+            . || true
+
+      - name: Trivy (deps, secrets, IaC/config)
+        continue-on-error: true
+        run: |
+          trivy fs . \
+            --scanners vuln,secret,misconfig \
+            --disable-telemetry \
+            --format json --output reports/trivy.json \
+            --exit-code 0 \
+            --quiet || true
+
+      - name: Gitleaks (secret history)
+        continue-on-error: true
+        run: |
+          gitleaks detect --source . --no-banner --redact \
+            --report-format json --report-path reports/gitleaks.json \
+            --exit-code 0 || true
+
+      - name: zizmor (GitHub Actions security)
+        continue-on-error: true
+        run: |
+          echo '[]' > reports/zizmor.json
+          if compgen -G ".github/workflows/*.y*ml" > /dev/null; then
+            # zizmor writes to stdout; --output is not a valid flag.
+            zizmor --format json .github/workflows > reports/zizmor.json || true
+          else
+            echo "No workflow files to scan."
+          fi
+
+      - name: OSV-Scanner (dependency CVEs)
+        continue-on-error: true
+        run: |
+          # Seed a valid empty report; osv-scanner writes nothing when a repo
+          # has no lockfiles/manifests ("No package sources found").
+          echo '{}' > reports/osv.json
+          osv-scanner scan source --recursive \
+            --format json --output reports/osv.json . || true
+
+      # --- Aggregate into a low-noise summary ---------------------------
+      - name: Summarize findings
+        id: summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          rep = Path("reports")
+
+          def load(name):
+              p = rep / name
+              if not p.exists() or p.stat().st_size == 0:
+                  return None
+              try:
+                  return json.loads(p.read_text(encoding="utf-8"))
+              except Exception:
+                  return None
+
+          high = []   # high-signal, "real" findings -> the alert set
+          info = []   # everything else -> artifact only
+
+          # Semgrep: ERROR severity = high-signal
+          d = load("semgrep.json") or {}
+          for r in d.get("results", []):
+              sev = r.get("extra", {}).get("severity", "INFO").upper()
+              row = f"{r.get('check_id','?')} @ {r.get('path','?')}:{r.get('start',{}).get('line','?')}"
+              (high if sev == "ERROR" else info).append(f"Semgrep[{sev}] {row}")
+
+          # Trivy: HIGH/CRITICAL vulns + any secret = high-signal
+          d = load("trivy.json") or {}
+          for res in d.get("Results", []) or []:
+              tgt = res.get("Target", "?")
+              for v in res.get("Vulnerabilities", []) or []:
+                  sev = (v.get("Severity") or "UNKNOWN").upper()
+                  row = f"Trivy[{sev}] {v.get('VulnerabilityID','?')} {v.get('PkgName','?')} @ {tgt}"
+                  (high if sev in ("HIGH", "CRITICAL") else info).append(row)
+              for s in res.get("Secrets", []) or []:
+                  high.append(f"Trivy[SECRET] {s.get('RuleID','?')} @ {tgt}")
+              for m in res.get("Misconfigurations", []) or []:
+                  sev = (m.get("Severity") or "UNKNOWN").upper()
+                  row = f"Trivy[MISCONFIG:{sev}] {m.get('ID','?')} @ {tgt}"
+                  (high if sev in ("HIGH", "CRITICAL") else info).append(row)
+
+          # Gitleaks: any leak = high-signal
+          d = load("gitleaks.json")
+          if isinstance(d, list):
+              for g in d:
+                  high.append(f"Gitleaks[SECRET] {g.get('RuleID','?')} @ {g.get('File','?')}")
+
+          # zizmor: high severity = high-signal
+          d = load("zizmor.json")
+          if isinstance(d, list):
+              for z in d:
+                  det = z.get("determinations", {}) or {}
+                  sev = (det.get("severity") or "").lower()
+                  rid = z.get("ident") or z.get("rule") or "?"
+                  (high if sev in ("high",) else info).append(f"zizmor[{sev or '?'}] {rid}")
+
+          # OSV: any vuln = high-signal
+          d = load("osv.json") or {}
+          for res in d.get("results", []) or []:
+              for pkg in res.get("packages", []) or []:
+                  name = pkg.get("package", {}).get("name", "?")
+                  for v in pkg.get("vulnerabilities", []) or []:
+                      high.append(f"OSV {v.get('id','?')} {name}")
+
+          lines = ["## Security Audit", ""]
+          if high:
+              lines.append(f"### 🔴 {len(high)} high-signal finding(s) — review these")
+              lines += [f"- {x}" for x in high[:100]]
+              if len(high) > 100:
+                  lines.append(f"- …and {len(high)-100} more (see artifact)")
+          else:
+              lines.append("### ✅ No high-signal findings")
+          lines += ["", f"_{len(info)} lower-severity item(s) recorded in the `security-audit-reports` artifact._"]
+          lines.append("")
+          lines.append("Audit mode: findings do not block merges. Full JSON in the run artifact.")
+
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"high_count={len(high)}\n")
+          print(f"high-signal={len(high)} info={len(info)}")
+          PY
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: security-audit-reports
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # --- Optional gate: only alerts (fails) on real findings ----------
+      - name: Gate on high-signal findings
+        if: >
+          always() &&
+          env.FAIL_ON_FINDINGS == 'true' &&
+          github.event_name != 'pull_request' &&
+          steps.summary.outputs.high_count != '0'
+        run: |
+          echo "::error::${{ steps.summary.outputs.high_count }} high-signal security finding(s). See the run summary and artifact."
+          exit 1
