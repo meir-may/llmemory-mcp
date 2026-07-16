@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FAIL_ON_FINDINGS: "false"
+  FAIL_ON_FINDINGS: "true"
   # Pinned tool versions (bump deliberately, not via mutable tags).
   SEMGREP_VERSION: "1.170.0"
   ZIZMOR_VERSION: "1.27.0"
